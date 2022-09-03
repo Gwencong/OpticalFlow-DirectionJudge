@@ -439,6 +439,7 @@ class ROI_GETER():
         self.img_shape = img_shape
 
     def _parse_contour(self,contour):
+        # 获取轮廓每个线段对应的直线
         lines = []
         for i,(pt1,pt2) in enumerate(zip(contour[:-1,:],contour[1:,:])):
             lines.append(self.Line(pt1,pt2,i))
@@ -447,6 +448,7 @@ class ROI_GETER():
         return lines
 
     def _order_points(self,pts):
+        # 排序box的四个顶点, 使其输出顺序为: [top left, top right, bottom right, bottom left]
         # sort the points based on their x-coordinates
         xSorted = pts[np.argsort(pts[:, 0]), :]
 
@@ -474,6 +476,7 @@ class ROI_GETER():
         return np.array([tl, tr, br, bl], dtype="float32")
 
     def _get_min_outer_rect(self,contour):
+        # 获取轮廓最下外接矩形
         rect = cv2.minAreaRect(contour)
         box = cv2.boxPoints(rect)
         box = np.int0(box)
