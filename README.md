@@ -1,4 +1,13 @@
 # Opencv 光流扶梯方向判断
+<div align=center><img src='data/visualize.jpg' width=400 height=300></div>
+
+### 更新内容：
+
+1. 加入了从分割的json文件中自动获取光流法所需的ROI区域的代码
+
+
+<details>
+<summary>8月11更新</summary>
 
 ### 更新内容：
 
@@ -13,3 +22,4 @@
 ### 跳变说明
 优化后对于跳变问题判断会更加稳定一些，但是对于光流特征不明显的情况，光流本身跟踪不到特征点点或者跟踪错误，跳变问题仍然存在。
 
+</details>
