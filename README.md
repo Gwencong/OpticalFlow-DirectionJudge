@@ -1,5 +1,5 @@
 # Opencv 光流扶梯方向判断
-<div align=center><img src='data/visualize.jpg' width=400 height=300></div>
+<div align=center><img src='data/visualize.jpg' width=500 height=250></div>
 
 ### 更新内容：
 
