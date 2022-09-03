@@ -1,9 +1,12 @@
+import os
 import cv2 
+import json
+import math
 import time   
 import numpy as np
 from tqdm import tqdm
 from collections import Counter
-
+from scipy.spatial import distance as dist
 
 class OpticalTrack():
     previewWindow = True
@@ -378,17 +381,429 @@ class OpticalTrack():
             points_id = np.arange(len(points),dtype=np.int32).reshape(len(points),1)
 
         return points,points_id
-            
 
+class ROI_GETER():
+    '''ROI for direction judge
+    '''
+    class Line:
+        def __init__(self,pt1,pt2,id=0) -> None:
+            self.pt1 = pt1
+            self.pt2 = pt2
+            self.id = id
+            self.x_low = min(pt1[0],pt2[0])
+            self.x_up  = max(pt1[0],pt2[0])
+            self.y_low = min(pt1[1],pt2[1])
+            self.y_up  = max(pt1[1],pt2[1])
+            self.k, self.b = self._get_kb(pt1,pt2)
+        
+        def _get_kb(self,pt1,pt2):
+            # 获取线段的斜率和截距
+            x1,y1 = pt1
+            x2,y2 = pt2
+            k = None if x1 == x2 else (y1-y2)/(x1-x2)
+            b = None if k is None else y1-k*x1
+            return k,b
+
+        def is_inrange(self,x=None,y=None):
+            x_inrange = True
+            y_inrange = True
+            if x is not None:
+                x_inrange = self.x_low <= x <= self.x_up
+            if y is not None:
+                y_inrange = self.y_low <= y <= self.y_up
+            return x_inrange and y_inrange
+  
+        def __call__(self, x=None,y=None, *args, **kwds):
+            '''输入x坐标, 则计算对应的y坐标; 输入y坐标, 则计算对应的x坐标\n
+            '''
+            assert (x is None) ^ (y is None ),'x and y should not be specified or None at the same time'
+            result = 0
+            if x is not None:  
+                if self.k is None:
+                    result = None       # 此时线段与y轴平行，给定x坐标无法求出y坐标
+                else:
+                    result = self.k*x + self.b
+            if y is not None:
+                if self.k is None:
+                    result = self.x_low # 此时线段与y轴平行，x坐标为固定值
+                elif self.k == 0:
+                    result = None       # 此时线段与y轴平行，给定y坐标无法求出x坐标
+                else:
+                    result = (y-self.b)/self.k
+            return result
+        
+
+    def __init__(self,contour,img_shape) -> None:
+        self.contour = contour
+        self.lines = self._parse_contour(contour)
+        self.img_shape = img_shape
+
+    def _parse_contour(self,contour):
+        lines = []
+        for i,(pt1,pt2) in enumerate(zip(contour[:-1,:],contour[1:,:])):
+            lines.append(self.Line(pt1,pt2,i))
+        first_pt,last_pt = contour[0,:],contour[-1,:]
+        lines.append(self.Line(first_pt,last_pt,i+1))
+        return lines
+
+    def _order_points(self,pts):
+        # sort the points based on their x-coordinates
+        xSorted = pts[np.argsort(pts[:, 0]), :]
+
+        # grab the left-most and right-most points from the sorted
+        # x-roodinate points
+        leftMost = xSorted[:2, :]
+        rightMost = xSorted[2:, :]
+
+        # now, sort the left-most coordinates according to their
+        # y-coordinates so we can grab the top-left and bottom-left
+        # points, respectively
+        leftMost = leftMost[np.argsort(leftMost[:, 1]), :]
+        (tl, bl) = leftMost
+
+        # now that we have the top-left coordinate, use it as an
+        # anchor to calculate the Euclidean distance between the
+        # top-left and right-most points; by the Pythagorean
+        # theorem, the point with the largest distance will be
+        # our bottom-right point
+        D = dist.cdist(tl[np.newaxis], rightMost, "euclidean")[0]
+        (br, tr) = rightMost[np.argsort(D)[::-1], :]
+
+        # return the coordinates in top-left, top-right,
+        # bottom-right, and bottom-left order
+        return np.array([tl, tr, br, bl], dtype="float32")
+
+    def _get_min_outer_rect(self,contour):
+        rect = cv2.minAreaRect(contour)
+        box = cv2.boxPoints(rect)
+        box = np.int0(box)
+        box = self._order_points(box)
+        return box
+
+    def _get_max_inner_rect(self, cont, cX, cY, x_min, x_max, y_min, y_max, img=None):
+            """中心延展法获取轮廓最大内接正矩形
+            cont: 轮廓
+            cX,cY: 中心点
+            x_min, x_max, y_min, y_max: 轮廓的最大外接矩形的四个顶点
+            """
+            # img 对应的是原图, 四个极值坐标对应的是最大外接矩形的四个顶点
+            c = cont  # 单个轮廓
+            # print(c)
+            range_x, range_y = x_max - x_min, y_max - y_min   # 轮廓的X，Y的范围
+            x1, x2, y1, y2 = cX, cX, cY, cY     # 中心扩散矩形的四个顶点x,y
+            cnt_range, radio = 0, 0
+            shape_flag = 1                      # 1：轮廓X轴方向比Y长；0：轮廓Y轴方向比X长
+            if range_x > range_y:                     # 判断轮廓 X方向更长
+                radio, shape_flag = int(range_x / range_y), 1
+                range_x_left = cX - x_min
+                range_x_right = x_max - cX
+                if range_x_left >= range_x_right:   # 取轴更长范围作for循环
+                    cnt_range = int(range_x_left)
+                if range_x_left < range_x_right:
+                    cnt_range = int(range_x_right)
+            else:                                   # 判断轮廓 Y方向更长
+                radio, shape_flag = int(range_y / range_x), 0
+                range_y_top = cY - y_min
+                range_y_bottom = y_max - cY
+                if range_y_top >= range_y_bottom:   # 取轴更长范围作for循环
+                    cnt_range = int(range_y_top)
+                if range_y_top < range_y_bottom:
+                    cnt_range = int(range_y_bottom)
+            print("X radio Y: %d " % radio)
+            print("---------new drawing range: %d-------------------------------------" % cnt_range)
+            flag_x1, flag_x2, flag_y1, flag_y2 = False, False, False, False
+            radio = 5       # 暂时设5，统一比例X:Y=5:1 因为发现某些会出现X:Y=4:1, 某些会出现X:Y=5:1
+            if shape_flag == 1:
+                radio_x = radio - 1
+                radio_y = 1
+            else:
+                radio_x = 1
+                radio_y = radio - 1
+            for ix in range(1, cnt_range, 1):      # X方向延展，假设X:Y=3:1，那延展步进值X:Y=3:1
+                # 第二象限延展
+                if flag_y1 == False:
+                    y1 -= 1 * radio_y       # 假设X:Y=1:1，轮廓XY方向长度接近，可理解为延展步进X:Y=1:1
+                    p_x1y1 = cv2.pointPolygonTest(c, (x1, y1), False)
+                    p_x2y1 = cv2.pointPolygonTest(c, (x2, y1), False)
+                    if p_x1y1 <= 0 or y1 <= y_min or p_x2y1 <= 0:  # 在轮廓外，只进行y运算，说明y超出范围
+                        for count in range(0, radio_y - 1, 1):    # 最长返回步进延展
+                            y1 += 1     # y超出, 步进返回
+                            p_x1y1 = cv2.pointPolygonTest(c, (x1, y1), False)
+                            if p_x1y1 <= 0 or y1 <= y_min or p_x2y1 <= 0:
+                                pass
+                            else:
+                                break
+                        # print("y1 = %d, P=%d" % (y1, p_x1y1))
+                        flag_y1 = True
+
+                if flag_x1 == False:
+                    x1 -= 1 * radio_x
+                    p_x1y1 = cv2.pointPolygonTest(c, (x1, y1), False)    # 满足第二象限的要求，像素都在轮廓内
+                    p_x1y2 = cv2.pointPolygonTest(c, (x1, y2), False)    # 满足第三象限的要求，像素都在轮廓内
+                    if p_x1y1 <= 0 or x1 <= x_min or p_x1y2 <= 0:       # 若X超出轮廓范围
+                        # x1 += 1  # x超出, 返回原点
+                        for count in range(0, radio_x-1, 1):       #
+                            x1 += 1         # x超出, 步进返回
+                            p_x1y1 = cv2.pointPolygonTest(c, (x1, y1), False)  # 满足第二象限的要求，像素都在轮廓内
+                            p_x1y2 = cv2.pointPolygonTest(c, (x1, y2), False)  # 满足第三象限的要求，像素都在轮廓内
+                            if p_x1y1 <= 0 or x1 <= x_min or p_x1y2 <= 0:
+                                pass
+                            else:
+                                break
+                        # print("x1 = %d, P=%d" % (x1, p_x1y1))
+                        flag_x1 = True              # X轴像左延展达到轮廓边界，标志=True
+                # 第三象限延展
+                if flag_y2 == False:
+                    y2 += 1 * radio_y
+                    p_x1y2 = cv2.pointPolygonTest(c, (x1, y2), False)
+                    p_x2y2 = cv2.pointPolygonTest(c, (x2, y2), False)
+                    if p_x1y2 <= 0 or y2 >= y_max or p_x2y2 <= 0:  # 在轮廓外，只进行y运算，说明y超出范围
+                        for count in range(0, radio_y - 1, 1):  # 最长返回步进延展
+                            y2 -= 1     # y超出, 返回原点
+                            p_x1y2 = cv2.pointPolygonTest(c, (x1, y2), False)
+                            if p_x1y2 <= 0 or y2 >= y_max or p_x2y2 <= 0:  # 在轮廓外，只进行y运算，说明y超出范围
+                                pass
+                            else:
+                                break
+                        # print("y2 = %d, P=%d" % (y2, p_x1y2))
+                        flag_y2 = True              # Y轴像左延展达到轮廓边界，标志=True
+                # 第一象限延展
+                if flag_x2 == False:
+                    x2 += 1 * radio_x
+                    p_x2y1 = cv2.pointPolygonTest(c, (x2, y1), False)    # 满足第一象限的要求，像素都在轮廓内
+                    p_x2y2 = cv2.pointPolygonTest(c, (x2, y2), False)    # 满足第四象限的要求，像素都在轮廓内
+                    if p_x2y1 <= 0 or x2 >= x_max or p_x2y2 <= 0:
+                        for count in range(0, radio_x - 1, 1):  # 最长返回步进延展
+                            x2 -= 1     # x超出, 返回原点
+                            p_x2y1 = cv2.pointPolygonTest(c, (x2, y1), False)  # 满足第一象限的要求，像素都在轮廓内
+                            p_x2y2 = cv2.pointPolygonTest(c, (x2, y2), False)  # 满足第四象限的要求，像素都在轮廓内
+                            if p_x2y1 <= 0 or x2 >= x_max or p_x2y2 <= 0:
+                                pass
+                            elif p_x2y2 > 0:
+                                break
+                        # print("x2 = %d, P=%d" % (x2, p_x2y1))
+                        flag_x2 = True
+                if flag_y1 and flag_x1 and flag_y2 and flag_x2:
+                    print("(x1,y1)=(%d,%d)" % (x1, y1))
+                    print("(x2,y2)=(%d,%d)" % (x2, y2))
+                    break
+            x1, x2, y1, y2 = int(x1),int(x2),int(y1),int(y2)
+            # cv.line(img, (x1,y1), (x2,y1), (255, 0, 0))
+            # cv2.rectangle(img, (x1, y1), (x2, y2), (255, 255, 255), 1, 8)
+
+            return x1, x2, y1, y2
+
+
+    def shrink_contour(self,contour,img_shape=None,scale=0.99,pixel=None):
+        '''缩小轮廓区域
+            Arguments:
+                contour: 扶梯梯路区域轮廓
+                img_shape: 轮廓对应的图片的形状[H,W]
+                scale: 缩小比例, list|tuple|int, e.g. [0.85,0.8], 对于x方向和y方向
+                pixel: 缩小的像素, 同scale, 区别是单位为像素级别, 如[10,10]表示x,y都缩小10像素
+            Return:
+                approx: 缩小后的轮廓
+        '''
+        assert 0.5<scale[0]<1.2 and 0.5<scale[1]<1.2 if isinstance(scale,(tuple,list)) else \
+            0.5<scale<1.2, f'Scale range should be [0.7,1.2]'
+        if img_shape is None:
+            img_shape = self.img_shape
+        mask = np.zeros(img_shape).astype(np.uint8)
+        mask_fill = cv2.fillConvexPoly(mask.copy(),contour,color=255)
+        # m = cv2.moments(contour)
+        # cX = int(m["m10"] / m["m00"])
+        # cY = int(m["m01"] / m["m00"])
+        x,y,w,h = cv2.boundingRect(contour)
+        cX = int(x + w/2)
+        cY = int(y + h/2)
+        area = cv2.contourArea(contour)
+        max_area = 1.5**2 * area
+        min_area = 0.5**2 * area
+
+        if pixel is not None:
+            if isinstance(pixel,(tuple,list)):
+                scalex = 1-pixel[0]/w
+                scaley = 1-pixel[0]/h
+            else:
+                scalex = scaley= 1-pixel/h
+        else:
+            if isinstance(scale,(tuple,list)):
+                scalex,scaley = scale
+            else:
+                scalex = scaley = scale
+
+        crop = mask_fill[y:y+h,x:x+w]
+        crop = cv2.resize(crop,dsize=(0,0),fx=scalex,fy=scaley)
+        nh,nw = crop.shape[:2]
+        y1 = int(cY-nh/2)
+        y2 = int(cY+nh/2)
+        x1 = int(cX-nw/2)
+        x2 = int(cX+nw/2)
+        mask[y1:y2,x1:x2] = crop
+        mask = mask.astype(np.uint8)
+        # cv2.imshow('test',mask)
+        # cv2.waitKey(0)
+        # exit()
+        new_contours,hierarchy = cv2.findContours(mask,cv2.RETR_LIST,cv2.CHAIN_APPROX_SIMPLE)
+        if new_contours:
+            areas = [cv2.contourArea(cnt) for cnt in new_contours]
+            areas_ids = np.array([(j,area) for j,area in enumerate(areas) if min_area<area<max_area]) # filter
+            areas = areas_ids[:,1]
+            indexes = areas_ids[:,0]
+            idx = int(indexes[np.argmax(areas)]) 
+            new_contour = new_contours[idx] # select contour with max area 
+            epsilon = 0.005 * cv2.arcLength(new_contour, True)
+            approx = cv2.approxPolyDP(new_contour,epsilon,True) # smoothing
+            # approx = cv2.convexHull(contour)
+            approx = approx.reshape(-1,2)
+        else:
+            raise AssertionError("No contour has been found")
+        return approx
+
+    def part_contour(self,contour,rate=0.5,rect=False):
+        '''按比例获取轮廓的下半部分\n
+            Arguments:
+                contour: 扶梯梯路区域轮廓
+                rate: 轮廓截取比例, 0~1, 1表示保留全部轮廓, 从下往上截取
+                rect: 是否返回矩形轮廓, 该矩形轮廓为截取后的轮廓的最大内接矩形
+            Return:
+                new_contour: 截取后的轮廓
+        '''
+        box = self._get_min_outer_rect(contour)
+        tl, tr, br, bl = box
+        height = bl[1]-tl[1]
+        y_clip = bl[1]-int(height*rate)
+        lines = [line for line in self.lines if line.is_inrange(y=y_clip)]
+        contour_list = contour.tolist()
+        insert_ids = []
+        for line in lines:
+            x = int(line(y=y_clip))
+            if x is not None:
+                extra = len(np.array(insert_ids)>=line.id+1)
+                contour_list.insert(line.id+1+extra,[x,y_clip])
+                insert_ids.append(line.id+1)
+
+        new_contour = []
+        for pt in contour_list:
+            if pt[1]>=y_clip:
+                new_contour.append(pt)
+        new_contour = np.array(new_contour)
+
+        if rect:
+            m = cv2.moments(new_contour)
+            cX = int(m["m10"] / m["m00"])
+            cY = int(m["m01"] / m["m00"])
+            tl, tr, br, bl = self._get_min_outer_rect(new_contour)
+            x_min,x_max,y_min,y_max = tl[0],br[0],tl[1],br[1]
+            x1, x2, y1, y2 = self._get_max_inner_rect(new_contour,cX,cY,x_min,x_max,y_min,y_max)
+            new_contour = np.array([(x1,y1),(x2,y1),(x2,y2),(x1,y2)])
+
+        return new_contour
+
+    def part_contour_simple(self,contour,rate=0.5,rect=False):
+        '''按比例获取轮廓的下半部分\n
+            Arguments:
+                contour: 扶梯梯路区域轮廓
+                rate: 轮廓截取比例, 0~1, 1表示保留全部轮廓, 从下往上截取
+                rect: 是否返回矩形轮廓, 该矩形轮廓为截取后的轮廓的最大内接矩形
+            Return:
+                new_contour: 截取后的轮廓
+        '''
+        area = cv2.contourArea(contour)
+        max_area = (rate+0.2) * area
+        min_area = (rate-0.2) * area
+
+        box = self._get_min_outer_rect(contour)
+        tl, tr, br, bl = box
+        height = br[1]-tl[1]
+        y_clip = br[1]-int(height*rate)
+
+        mask_zero = np.zeros(self.img_shape).astype(np.uint8)
+        mask_fill = cv2.fillConvexPoly(mask_zero.copy(),contour,255)
+        nx = np.arange(self.img_shape[1])
+        ny = np.arange(self.img_shape[0])
+        grid_x,grid_y = np.meshgrid(nx,ny)
+        mask = np.where(grid_y>=y_clip,mask_fill,mask_zero)
+
+        # vis_img = mask_zero+200
+        # self.draw_point(vis_img,box,vis_ptid=True)
+        # cv2.imshow('test',vis_img)
+        # cv2.waitKey(0)
+
+        new_contours,hierarchy = cv2.findContours(mask,cv2.RETR_LIST,cv2.CHAIN_APPROX_SIMPLE)
+        if new_contours:
+            areas = [cv2.contourArea(cnt) for cnt in new_contours]
+            areas_ids = np.array([(j,area) for j,area in enumerate(areas) if min_area<area<max_area]) # filter
+            areas = areas_ids[:,1]
+            indexes = areas_ids[:,0]
+            idx = int(indexes[np.argmax(areas)]) 
+            new_contour = new_contours[idx] # select contour with max area 
+            epsilon = 0.005 * cv2.arcLength(new_contour, True)
+            new_contour = cv2.approxPolyDP(new_contour,epsilon,True) # smoothing
+            # approx = cv2.convexHull(contour)
+            new_contour = new_contour.reshape(-1,2)
+        else:
+            raise AssertionError("No contour has been found")
+
+        if rect:
+            m = cv2.moments(new_contour)
+            cX = int(m["m10"] / m["m00"])
+            cY = int(m["m01"] / m["m00"])
+            tl, tr, br, bl = self._get_min_outer_rect(new_contour)
+            x_min,x_max,y_min,y_max = tl[0],br[0],tl[1],br[1]
+            x1, x2, y1, y2 = self._get_max_inner_rect(new_contour,cX,cY,x_min,x_max,y_min,y_max)
+            new_contour = np.array([(x1,y1),(x2,y1),(x2,y2),(x1,y2)])
+        
+        # cv2.imshow('test',mask_fill)
+        # cv2.waitKey(0)
+        # cv2.imshow('test',mask)
+        # cv2.waitKey(0)
+
+        return new_contour
+
+    def draw_point(self,img,points,vis_ptid=True):
+        for i,pt in enumerate(points):
+            cv2.circle(img,(int(pt[0]),int(pt[1])),5,(0,255,255),-1)
+            cv2.putText(img,str(i),(int(pt[0])+10,int(pt[1])+10),cv2.LINE_AA,0.75,(55,55,55))
+        
+
+def roi_from_json(file_path, part_rate=0.7, reduce_scale=[0.85,0.8], rect=False):
+    '''从分割算法保存的json文件中获取光流所需ROI区域
+        Arguments:
+            file_path: json 文件路径
+            part_rate: 轮廓截取比例
+            reduce_scale: 截取后的轮廓内缩比例(不做轮廓缩小可能会影响光流特征点的获取)
+            rect: 是否返回矩形的ROI区域, default: False
+        Return:
+            part_contour: 光流法所需取的ROI区域
+    '''
+    assert os.path.exists(file_path),f'file not found: `{file_path}`'
+    with open(file_path,'r',encoding='utf-8') as f:
+        data = json.load(f)
+    assert 'step' in data, 'step contours not found'
+    assert 'imgHeight' in data and 'imgWidth' in data, 'img shape info not found'
+    step_contour = np.array(data['step'])
+    height = data['imgHeight']
+    width = data['imgWidth']
+
+    roi_get = ROI_GETER(step_contour,(height,width))
+    part_contour = roi_get.part_contour_simple(step_contour,rate=part_rate,rect=rect)
+    if reduce_scale is not None:
+        part_contour = roi_get.shrink_contour(part_contour,(height,width),scale=reduce_scale)
+    
+    return part_contour
         
 if __name__ == "__main__":
     track = OpticalTrack()
-    # camera_id = "test.mp4"
-    # roi = np.array([[550,328],[670,328],[670,488],[550,488]])
-    camera_id = "../4mm_up.mp4"
-    # camera_id= "../stop.mp4"
-    roi = np.array([[682,385],[790,385],[790,515],[681,514]])
-
-    # camera_id = "../4mm_202207221514_下行.mp4"
-    # roi = np.array([[582,420],[710,420],[710,530],[581,529]])
+    camera_id = "data/test.mp4"
+    # roi = np.array([[665,447],[845,447],[845,510],[665,510]])
+    roi = roi_from_json('config/seg_result.json',part_rate=0.5,rect=False)
+    print(roi)
     track.opticalTrack(camera_id,roi)
+
+    # track = OpticalTrack()
+    # camera_id = r"../../7月22阶梯型扶梯数据/4mm_202207221514_下行.mp4"
+    # roi = roi_from_json(r'../segmentation/output/seg_result.json',part_rate=0.5,rect=False)
+    # print(roi)
+    # track.opticalTrack(camera_id,roi)
+
