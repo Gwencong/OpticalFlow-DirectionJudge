@@ -363,9 +363,22 @@ class OpticalTrack():
         '''
         numPts = self.numPts
         trailLength = self.trailLength
+
+        # filter feature points out of image
+        img_h,img_w = roi_mask.shape[:2]
+
+        coord_x = np.array(points[:,0,0], dtype=np.int64)
+        valid_idx = np.where(np.bitwise_and(0<=coord_x,coord_x<img_w),True,False)   # x limit
+        points = points[valid_idx]
+        points_id = points_id[valid_idx]
+
+        coord_y = np.array(points[:,0,1], dtype=np.int64)
+        valid_idy = np.where(np.bitwise_and(0<=coord_y,coord_y<img_h),True,False)   # y limit
+        points = points[valid_idy]
+        points_id = points_id[valid_idy]
         
         # filter feature points out of ROI 
-        coord_x = np.asarray(points[:,0,0], dtype=np.int64)
+        coord_x = np.array(points[:,0,0], dtype=np.int64)
         coord_y = np.array(points[:,0,1], dtype=np.int64)
         valid_indices = np.where(roi_mask[coord_y,coord_x]==255,True,False)
         points = points[valid_indices]
@@ -795,7 +808,7 @@ def roi_from_json(file_path, part_rate=0.7, reduce_scale=[0.85,0.8], rect=False)
         part_contour = roi_get.shrink_contour(part_contour,(height,width),scale=reduce_scale)
     
     return part_contour
-        
+
 if __name__ == "__main__":
     track = OpticalTrack()
     camera_id = "data/test.mp4"
@@ -805,8 +818,8 @@ if __name__ == "__main__":
     track.opticalTrack(camera_id,roi)
 
     # track = OpticalTrack()
-    # camera_id = r"../../7月22阶梯型扶梯数据/4mm_202207221514_下行.mp4"
-    # roi = roi_from_json(r'../segmentation/output/seg_result.json',part_rate=0.5,rect=False)
+    # camera_id = r"D:\my file\project\扶梯项目\鲁邦通数据\8mm_20220427163046407.mp4"
+    # roi = roi_from_json(r'C:\Users\28571\Documents\WeChat Files\wxid_xxfvz9tm8jx122\FileStorage\File\2022-09\Se0.json',part_rate=0.5,rect=False)
     # print(roi)
     # track.opticalTrack(camera_id,roi)
 
