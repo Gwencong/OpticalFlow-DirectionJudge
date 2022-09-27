@@ -5,11 +5,17 @@ import math
 import time   
 import numpy as np
 from tqdm import tqdm
+from datetime import datetime
 from collections import Counter
 from scipy.spatial import distance as dist
 
 class OpticalTrack():
-    previewWindow = True
+    previewWindow = False
+    savevid = False
+
+    inited = False  # if first tracking feature points is found
+    index = 0       # frame id
+    fps = 25        # frame FPS
     
     # params for Shi-Tomasi corner detection
     shitomasi_params = {"qualityLevel": 0.1,"minDistance": 7,"blockSize": 7}
@@ -24,19 +30,33 @@ class OpticalTrack():
     trailFade = 4       # the intensity at which the trail fades
     pointSize = 15      # pixel radius of the circle to draw over tracked points
 
+    orient_num = 100    # the record number of frame's orient in the past time
 
-    def __init__(self,numPts=30,trailLength=50,savevid=False) -> None:
+    _UP      = -1   # ↑, up state
+    _STOP    = 0    # -, stop state
+    _DOWN    = 1    # ↓, down state
+    _UNSURE  = 2    # unknown state
+
+
+    def __init__(self,numPts=30,trailLength=50,conf_thresh=0.9,roi=None,roiJsonFile=None,partRate=0.5) -> None:
         self.numPts = numPts            # max number of points to track
         self.trailLength = trailLength  # numeber of past time frames to keep 
-        self.savevid = savevid          # whether to save result video
+        self.conf_thresh = conf_thresh  # confidence threshold
+        self.roiJsonFile = roiJsonFile  # seg result json file from whitch the roi will be get
+        self.part_rate = partRate       # step roi area to be part
 
         self.orients_previous = np.zeros((1,2))     # overall oriention vector of the previous time
-        self.orient_history = [0 for i in range(25)]# orientation history of past frames
+        self.orient_history = [0 for i in range(self.orient_num)] # orientation history of past frames
         self.trail_states = np.zeros((numPts,2))    # whether a point is still being tracked
         self.trail_history = [[[(0,0), (0,0)] for j in range(trailLength)] for i in range(numPts)]
+
+        if roi is None and isinstance(roiJsonFile,str):
+            self.roi = roi_from_json(roiJsonFile,part_rate=partRate,rect=False)
+        else:
+            self.roi = roi
         
       
-    def opticalTrack(self,camera_id,roi):
+    def opticalTrack_old(self,camera_id,roi):
         start_time = time.time()
 
         # SETUP -----------------------------------------------------------------------
@@ -193,6 +213,146 @@ class OpticalTrack():
         pbar.close()
         print('\nComplete!\n')
     
+
+    def opticalTrack(self,t_frame):
+        assert self.roi is not None, f'ROI area is not set! Please use roi_from_json() to get roi firstly.'
+        orient = None
+        if t_frame is None:
+            print("t_frame is None")
+            return orient
+        self.index += 1
+        if not self.inited:
+            self.old_frame = t_frame.copy()
+            #self.roi = roi
+            self.old_gray = cv2.cvtColor(self.old_frame, cv2.COLOR_BGR2GRAY)
+            if self.old_gray is None:
+                print("old_gray is None")
+                return orient
+            # create crosshair mask 
+            self.crosshairmask = np.zeros_like(self.old_gray)
+            self.crosshairmask = cv2.fillConvexPoly(self.crosshairmask,self.roi,color=255)
+            self.visualmask = cv2.fillConvexPoly(np.zeros_like(self.old_frame),self.roi,color=(255,255,255))
+
+            # create roi mask
+            self.mask = cv2.fillConvexPoly(np.zeros_like(self.old_gray),self.roi,color=255)
+
+            # get features from first frame
+            self.old_points = cv2.goodFeaturesToTrack(self.old_gray, maxCorners=self.numPts, mask=self.crosshairmask, **self.shitomasi_params)
+            if self.old_points is None:
+                print("self.old_points is None,Init Fail")
+                return orient
+            else:
+                print("Init Success")
+                self.inited = True
+                self.start_time = time.time()
+            self.points_id = np.arange(len(self.old_points),dtype=np.int32).reshape(len(self.old_points),1)  # feature point id in trail_history
+
+            # if saving video
+            if self.savevid:
+                # path to save output video
+                savepath = "data/" + datetime.now().strftime("%Y-%m-%d %H%M%S") + '_LK_FLOW' + '.mp4'
+                print(f"Saving Output video to: {savepath}")
+
+                # get shape of video frames
+                height, width, _ = self.old_frame.shape
+
+                # setup videowriter object
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                self.videoOut = cv2.VideoWriter(savepath, fourcc, self.fps, (width, height))
+        else:
+            new_frame = t_frame.copy()
+            # convert to grayscale
+            new_frame_gray = cv2.cvtColor(new_frame, cv2.COLOR_BGR2GRAY)
+            # PROCESS VIDEO ---------------------------------------------------------------
+            # calculate optical flow
+            new_points, st, err = cv2.calcOpticalFlowPyrLK(self.old_gray, new_frame_gray, self.old_points, None, **self.LK_params)
+            # select good points
+            if self.old_points is not None:
+                good_new = new_points[st==1]
+                good_old = self.old_points[st==1]
+                good_id = self.points_id[st==1]
+            # create trail mask to add to image
+            trailMask = np.zeros_like(self.old_frame)
+            # calculate motion lines and points, and check points according to history trail
+            valid_ids = []
+            for i,(new,old) in enumerate(zip(good_new, good_old)):
+                # flatten coords
+                a,b = new.ravel()
+                c,d = old.ravel()
+                k = good_id[i]
+
+                # list of the prev and current points converted to int
+                linepts = [(int(a),int(b)), (int(c),int(d))]
+
+                # add points to the trail history
+                self.trail_history[k].insert(0, linepts)
+
+                # check valid of trail
+                isvalid = self.check_flow(self.trail_history[k])
+                if isvalid:
+                    valid_ids.append(i)
+                    # points update times
+                    self.trail_states[k,1] += 1
+
+                # add trail lines to image
+                if self.previewWindow and isvalid:
+                    self.draw_trail(trailMask,self.trail_history,k,new_frame)
+                
+                # get rid of the trail segment
+                self.trail_history[k].pop()
+
+            # set trail states, 0 for missed, 1 for still being tracked
+            self.trail_states[:, 0] = 0
+            self.trail_states[good_id[valid_ids], 0] = 1
+
+            # filter invalid flow
+            self.trail_history = self.filter_invalid_flow(self.trail_history,lateral_thresh=50)
+
+            # Calculation direction
+            orient_one = self.get_orientation(self.trail_history,self.trail_states,self.orients_previous,self.index)
+            orient,conf,count_info = self.update_orient(self.orient_history, orient_one, self.conf_thresh)
+            if self.index<self.orient_num:
+                orient = None
+
+            if orient==1:
+                cv2.putText(new_frame,'down' + str(self.index),(20,50),cv2.LINE_AA,2,(255,0,0),2)
+            elif orient==-1:
+                cv2.putText(new_frame,'up' + str(self.index),(20,50),cv2.LINE_AA,2,(255,0,0),2)
+            elif orient==0:
+                cv2.putText(new_frame,'-' + str(self.index),(20,50),cv2.LINE_AA,2,(255,0,0),2)
+            else:
+                cv2.putText(new_frame,'unsure' + str(self.index),(20,50),cv2.LINE_AA,2,(255,255,0),2)
+            
+            # add trail to frame
+            new_frame = cv2.addWeighted(new_frame,0.7,self.visualmask,0.3,0)
+            img = cv2.add(new_frame, trailMask)
+            if self.previewWindow:
+                avgFS = self.index / (time.time()-self.start_time)
+                print( 'orient={}, FIndex={:04d}, avgFS={:2.2f}, conf={:.2f}'.format(orient, self.index, avgFS, conf) )
+                
+            # write frames to new output video
+            if self.savevid:
+                self.videoOut.write(img)
+            # show the frames
+            if self.previewWindow:
+                cv2.imshow('optical flow {}'.format(self), img)
+                # kill window if ESC is pressed
+                # rest = max(1/self.fps - (time.time()-self.start_time),1)
+                # k = cv2.waitKey(rest) & 0xff
+                # if k == 27:
+                #     return
+            # update previous frame and previous points
+            self.old_gray = new_frame_gray.copy()
+            self.old_points = good_new[valid_ids,...].reshape(-1,1,2)
+            self.points_id = good_id[valid_ids,...].reshape(-1,1)
+            
+            # if old_points < numPts, get new points
+            self.old_points,self.points_id = self.update_points(self.old_gray,self.old_points,self.points_id,self.mask,self.crosshairmask)
+            # trail_states = self.trail_states
+            # trail_history = self.trail_history
+            assert len(self.points_id) == len(self.old_points)
+        return orient    
+
     def draw_trail(self,trailMask,trail,k,frame):
         fade = self.trailFade
         color = self.color[k].tolist() # get color for this point
@@ -258,16 +418,20 @@ class OpticalTrack():
 
         angle = np.arctan2(orients[:,1],orients[:,0])/np.pi*180
         angle = np.nanmean(angle)
+        magnitude = np.sqrt(np.square(orients).sum())
 
         orients_previous[0,0] = orients[0,0]
         orients_previous[0,1] = orients[0,1]
         
         if -150<angle<-30 and orients[0,1]<-stop_thresh:
-            orient = -1 # ↑
+            orient = self._UP       # ↑
         elif 30<angle<150 and orients[0,1]>stop_thresh:
-            orient = 1  # ↓
+            orient = self._DOWN     # ↓
+        elif magnitude<1.414*stop_thresh or ((-30<=angle<=30 or 150<=angle<=180 or -180<=angle<=-150) and abs(orients[0,1])<=stop_thresh):
+            orient = self._STOP     # -
         else:
-            orient = 0  # -
+            orient = self._UNSURE   # unsure
+        # print(orients)
         return orient
 
     def get_default_pts(self,roi,num_pts=60):
@@ -350,13 +514,20 @@ class OpticalTrack():
             cur_orient = orient if orient!=0 else cur_orient
         return False if reverse_times>2 else True
 
-    def update_orient(self,orient_history,orient):
-        '''update orient according to the orient appeared most times in history orient
+    def update_orient(self,orient_history,orient_one,conf_thresh=0.9):
+        '''update orient alccording to the orient appeared most times in history orient
         '''
-        orient_history.insert(0,orient)
+        orient_history.insert(0,orient_one)
         orient_history.pop()
-        orient = Counter(orient_history).most_common(1)[0][0]
-        return orient
+        counter = Counter(orient_history)
+        orient_dict = Counter(orient_history).most_common(1)[0]
+        orient, count = orient_dict
+        conf = count/len(orient_history) # conf = mostly appeared orient / num of total orient
+        if conf < conf_thresh:
+            orient = self._UNSURE        # if conf < conf_thresh, set state to unsure
+        # print(counter)
+        count_dict = list(counter.items())
+        return orient,conf,count_dict
 
     def update_points(self,frame_gray,points,points_id,roi_mask,crosshairmask):
         '''determine whether the feature points need to be updated
@@ -390,10 +561,18 @@ class OpticalTrack():
             self.trail_states = np.zeros((numPts,2))
             self.trail_history = [[[(0,0), (0,0)] for j in range(trailLength)] for i in range(numPts)]
             # update points and points id
-            points = self.get_FeaturesToTrack(frame_gray, maxCorners=numPts, mask=crosshairmask, roi=roi)
+            points = self.get_FeaturesToTrack(frame_gray, maxCorners=numPts, mask=crosshairmask, roi=self.roi)
             points_id = np.arange(len(points),dtype=np.int32).reshape(len(points),1)
 
         return points,points_id
+
+    def reset(self):
+        self.index = 0
+        self.inited = False
+        self.orients_previous = np.zeros((1,2))         # overall oriention vector of the previous time
+        self.orient_history = [0 for i in range(25)]    # orientation history of past frames
+        self.trail_states = np.zeros((self.numPts,2))   # whether a point is still being tracked
+        self.trail_history = [[[(0,0), (0,0)] for j in range(self.trailLength)] for i in range(self.numPts)]
 
 class ROI_GETER():
     '''ROI for direction judge
@@ -809,7 +988,8 @@ def roi_from_json(file_path, part_rate=0.7, reduce_scale=[0.85,0.8], rect=False)
     
     return part_contour
 
-if __name__ == "__main__":
+
+def sample1():
     track = OpticalTrack()
     camera_id = "data/test.mp4"
     # roi = np.array([[665,447],[845,447],[845,510],[665,510]])
@@ -817,9 +997,33 @@ if __name__ == "__main__":
     print(roi)
     track.opticalTrack(camera_id,roi)
 
-    # track = OpticalTrack()
-    # camera_id = r"D:\my file\project\扶梯项目\鲁邦通数据\8mm_20220427163046407.mp4"
-    # roi = roi_from_json(r'C:\Users\28571\Documents\WeChat Files\wxid_xxfvz9tm8jx122\FileStorage\File\2022-09\Se0.json',part_rate=0.5,rect=False)
-    # print(roi)
-    # track.opticalTrack(camera_id,roi)
+def sample2():
+    # 测试用例
+    camera_id = './data/test.mp4'
+    seg_json  = 'config/seg_result.json'
+    print("camera_id = {}, seg_json = {}".format(camera_id, seg_json))
+    track = OpticalTrack(roiJsonFile=seg_json, conf_thresh=0.9)
+    track.previewWindow = True
+    track.savevid = False
+    cap = cv2.VideoCapture(camera_id)
+
+    stream_continue, t_frame = cap.read()
+    while stream_continue:
+        orient = track.opticalTrack(t_frame)
+        stream_continue, t_frame = cap.read()
+        k = cv2.waitKey(1) & 0xff
+        if k == 27:
+            return
+    print("End of Stream")
+
+    ## 说明：如果self.opticalTrack()前后两次调用时间间隔较大，需要先调用 self.reset() 函数
+    ##      清空历史信息，否者会影响第二次的方向判断
+    ## 比如，第一次方向判断时不断送入图片调用 self.opticalTrack(t_frame), 在获取到确定的方
+    ## 向后停止了运行, 然后过了一段时间, 想再次调用 self.opticalTrack(t_frame) 来判断目前的
+    ## 扶梯运行方向如何, 此时需要先调用 self.reset() 重置状态，清空历史帧和历史方向信息，然后
+    ## 再不断送图片到 self.self.opticalTrack(t_frame) 获取方向。
+
+
+if __name__ == "__main__":
+    sample2()
 
